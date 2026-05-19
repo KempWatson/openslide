@@ -67,7 +67,9 @@ static const char ATTR_TILE2[] = "Tile2";
 static const char ATTR_OVERLAP_X[] = "OverlapX";
 static const char ATTR_OVERLAP_Y[] = "OverlapY";
 static const char DIRECTION_RIGHT[] = "RIGHT";
+static const char DIRECTION_LEFT[] = "LEFT";
 static const char DIRECTION_UP[] = "UP";
+static const char DIRECTION_DOWN[] = "DOWN";
 
 #define PARSE_INT_ATTRIBUTE_OR_RETURN(NODE, NAME, OUT, RET)	\
   do {								\
@@ -562,19 +564,31 @@ static struct bif *parse_level0_xml(const char *xml,
       struct joint *joint;
       bool ok;
       bool direction_y = false;
-      //g_debug("%s, tile1 %"PRId64" %"PRId64", tile2 %"PRId64" %"PRId64, (char *) direction, tile1_col, tile1_row, tile2_col, tile2_row);
       if (!xmlStrcmp(direction, BAD_CAST DIRECTION_RIGHT)) {
         // get left joint of right tile
         struct tile *tile =
           &area->tiles[tile2_row * area->tiles_across + tile2_col];
         joint = &tile->left;
         ok = (tile2_col == tile1_col + 1 && tile2_row == tile1_row);
+      } else if (!xmlStrcmp(direction, BAD_CAST DIRECTION_LEFT)) {
+        // tile2 is to the LEFT of tile1 — tile1's left edge joins tile2's right edge
+        struct tile *tile =
+          &area->tiles[tile1_row * area->tiles_across + tile1_col];
+        joint = &tile->left;
+        ok = (tile2_col == tile1_col - 1 && tile2_row == tile1_row);
       } else if (!xmlStrcmp(direction, BAD_CAST DIRECTION_UP)) {
         // get top joint of bottom tile
         struct tile *tile =
           &area->tiles[tile1_row * area->tiles_across + tile1_col];
         joint = &tile->top;
         ok = (tile2_col == tile1_col && tile2_row == tile1_row - 1);
+        direction_y = true;
+      } else if (!xmlStrcmp(direction, BAD_CAST DIRECTION_DOWN)) {
+        // tile2 is BELOW tile1 — tile2's top edge joins tile1's bottom edge
+        struct tile *tile =
+          &area->tiles[tile2_row * area->tiles_across + tile2_col];
+        joint = &tile->top;
+        ok = (tile2_col == tile1_col && tile2_row == tile1_row + 1);
         direction_y = true;
       } else {
         g_set_error(err, OPENSLIDE_ERROR, OPENSLIDE_ERROR_FAILED,
