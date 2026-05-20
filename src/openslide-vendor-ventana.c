@@ -648,6 +648,18 @@ static struct bif *parse_level0_xml(const char *xml,
         return NULL;
       }
 
+      // read values (faithful to patched 4.0.0.8 — re-parses the same three
+      // attributes; functionally a no-op since joint values are unchanged
+      // between the first parse above and this point)
+      PARSE_DOUBLE_ATTRIBUTE_OR_RETURN(joint_info, ATTR_OVERLAP_X,
+                                       joint.offset_x, NULL);
+      joint.offset_x *= -1;
+      PARSE_DOUBLE_ATTRIBUTE_OR_RETURN(joint_info, ATTR_OVERLAP_Y,
+                                       joint.offset_y, NULL);
+      joint.offset_y *= -1;
+      PARSE_INT_ATTRIBUTE_OR_RETURN(joint_info, ATTR_CONFIDENCE,
+                                    joint.confidence, NULL);
+
       // add to weighted totals used to derive bif->tile_advance_x/y
       if (direction_y) {
         total_offset_y += joint.confidence * joint.offset_y;
@@ -664,13 +676,12 @@ static struct bif *parse_level0_xml(const char *xml,
   bif->num_areas = area_array->len;
   bif->areas =
     (struct area **) g_ptr_array_free(g_steal_pointer(&area_array), false);
-  bif->tile_advance_x = tiff_tile_width + total_offset_x / total_x_weight;
-  bif->tile_advance_y = tiff_tile_height + total_offset_y / total_y_weight;
   if (is_dp200) {
-    // DP 200 scanners use per-tile offsets to handle overlap accurately,
-    // so the global advance is just the raw tile size.
     bif->tile_advance_x = tiff_tile_width;
     bif->tile_advance_y = tiff_tile_height;
+  } else {
+    bif->tile_advance_x = tiff_tile_width + total_offset_x / total_x_weight;
+    bif->tile_advance_y = tiff_tile_height + total_offset_y / total_y_weight;
   }
   //g_debug("advances: %g %g", bif->tile_advance_x, bif->tile_advance_y);
 
@@ -752,66 +763,49 @@ static struct _openslide_grid *create_bif_grid(openslide_t *osr,
                                    bif->tile_advance_y / downsample,
                                    read_subtile_tilemap, NULL);
 
-  // For DP 200, find the slide-wide origin so each area's offset can be
-  // expressed relative to a common point. Pre-DP-200 doesn't need this.
+  // get start x and y coordinates of the slide as a whole
   double slide_start_x = INFINITY;
   double slide_start_y = INFINITY;
-  if (is_dp200) {
-    for (int32_t i = 0; i < bif->num_areas; i++) {
-      if (bif->areas[i]->x < slide_start_x) slide_start_x = bif->areas[i]->x;
-      if (bif->areas[i]->y < slide_start_y) slide_start_y = bif->areas[i]->y;
-    }
+  for (int32_t i = 0; i < bif->num_areas; i++) {
+    double area_start_x = bif->areas[i]->x;
+    double area_start_y = bif->areas[i]->y;
+    slide_start_x = (area_start_x < slide_start_x) ? area_start_x : slide_start_x;
+    slide_start_y = (area_start_y < slide_start_y) ? area_start_y : slide_start_y;
   }
 
   for (int32_t i = 0; i < bif->num_areas; i++) {
     struct area *area = bif->areas[i];
+    //g_debug("ds %g area %d pos %"PRId64" %"PRId64, downsample, i, area->x, area->y);
 
-    if (!is_dp200) {
-      // Pre-DP-200: simple uniform offset per area, derived from the
-      // weighted-average tile_advance.
-      double offset_x =
-        (area->x - area->start_col * bif->tile_advance_x) / downsample;
-      double offset_y =
-        (area->y - area->start_row * bif->tile_advance_y) / downsample;
-      //g_debug("ds %g area %d pos %"PRId64" %"PRId64" offset %g %g", downsample, i, area->x, area->y, offset_x, offset_y);
-      for (int64_t row = area->start_row;
-           row < area->start_row + area->tiles_down; row++) {
-        for (int64_t col = area->start_col;
-             col < area->start_col + area->tiles_across; col++) {
-          _openslide_grid_tilemap_add_tile(grid,
-                                           col, row,
-                                           offset_x, offset_y,
-                                           subtile_w, subtile_h,
-                                           NULL);
-        }
-      }
-      continue;
-    }
+    // BIF files can have tiles with overlap, which is adjusted for using an
+    // offset value. Here we accumulate the total offsets in each direction as
+    // we iterate through the tiles to prevent gaps from appearing.
 
-    // DP 200: accumulate the per-tile overlap offsets as we walk the area,
-    // so the displayed tiles line up correctly even though we use the raw
-    // tile size as the global advance.
-
-    // Per-area offset so the area starts at its recorded (x, y) rather than
-    // at start_col/start_row * tile_advance (which would not account for
-    // accumulated overlaps in earlier areas).
+    // Each area has an x and y offset to ensure that it starts at area->x in
+    // the tilemap grid. Without this offset, it will start at the start
+    // row/column times the tile width which is not always correct due to
+    // accumulated overlaps/offsets in previous areas.
     double area_offset_x =
       area->x - (area->start_col * bif->tile_advance_x + slide_start_x);
     double area_offset_y =
       area->y - (area->start_row * bif->tile_advance_y + slide_start_y);
 
-    // Per-column running Y offset (accumulates downward as we walk rows).
+    // cumulative offset_y for each column
     g_autofree double *offset_ys = g_new(double, area->tiles_across);
     for (int64_t col = 0; col < area->tiles_across; col++) {
       offset_ys[col] = area_offset_y;
     }
 
     for (int64_t row = 0; row < area->tiles_down; row++) {
-      double offset_x = area_offset_x;  // running X offset for this row
+      // cumulative offset_x for this row
+      double offset_x = area_offset_x;
       for (int64_t col = 0; col < area->tiles_across; col++) {
-        struct tile *tile = &area->tiles[row * area->tiles_across + col];
-        offset_x += tile->offset_x;
-        offset_ys[col] += tile->offset_y;
+        if (is_dp200) {
+          // use the per-tile offsets only for DP 200 scans
+          struct tile *tile = &area->tiles[row * area->tiles_across + col];
+          offset_x += tile->offset_x;
+          offset_ys[col] += tile->offset_y;
+        }
         _openslide_grid_tilemap_add_tile(grid,
                                          area->start_col + col,
                                          area->start_row + row,
@@ -866,8 +860,11 @@ static bool ventana_open(openslide_t *osr, const char *filename,
   }
 
   // Determine whether this is a DP 200 scanner. ScannerModel comes from the
-  // iScan element. Some DP 200 slides only carry that element under
-  // EncodeInfo/SlideInfo at level 1, so check there if level-0 was silent.
+  // iScan element at level 0. Some slides also carry an iScan element under
+  // EncodeInfo/SlideInfo at level 1; the patched 4.0.0.8 source parses this
+  // as a fallback. Note that, faithful to the patched source, scanner_model
+  // is NOT re-read after this fallback parse; the local variable remains
+  // whatever it was after the level-0 lookup.
   char *scanner_model =
     g_hash_table_lookup(osr->properties, "ventana.ScannerModel");
   if (!scanner_model) {
@@ -879,8 +876,6 @@ static bool ventana_open(openslide_t *osr, const char *filename,
       if (!parse_ventana_iScan_xml(osr, lvl1_xml, err)) {
         return false;
       }
-      scanner_model =
-        g_hash_table_lookup(osr->properties, "ventana.ScannerModel");
     } else if (g_error_matches(tmp_err, OPENSLIDE_ERROR,
                                OPENSLIDE_ERROR_NO_VALUE)) {
       g_clear_error(&tmp_err);
