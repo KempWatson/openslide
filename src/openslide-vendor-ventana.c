@@ -395,8 +395,8 @@ static int width_compare(gconstpointer a, gconstpointer b) {
   }
 }
 
-static bool parse_initial_xml(openslide_t *osr, const char *xml,
-                              GError **err) {
+static bool parse_ventana_iScan_xml(openslide_t *osr, const char *xml,
+                                    GError **err) {
   // parse
   g_autoptr(xmlDoc) doc = _openslide_xml_parse(xml, err);
   if (!doc) {
@@ -417,6 +417,16 @@ static bool parse_initial_xml(openslide_t *osr, const char *xml,
                           g_strdup_printf("ventana.%s", attr->name),
                           g_strdup((char *) value));
     }
+  }
+
+  return true;
+}
+
+static bool parse_initial_xml(openslide_t *osr, const char *xml,
+                              GError **err) {
+  // parse XML and copy iScan attributes
+  if (!parse_ventana_iScan_xml(osr, xml, err)) {
+    return false;
   }
 
   // set background color from iScan node property.
@@ -844,10 +854,15 @@ static bool ventana_open(openslide_t *osr, const char *filename,
     const char *lvl1_xml = _openslide_tifflike_get_buffer(tl, 1, 
                                                           TIFFTAG_XMLPACKET,
                                                           &tmp_err);
-
-/*
     if (lvl1_xml) {
-      parse_ventana_iScan_xml(osr, lvl1_xml, err);
+      if (!parse_ventana_iScan_xml(osr, lvl1_xml, err)) {
+        return false;
+      }
+      // re-read ScannerModel: the level-1 iScan block may carry it even when
+      // level 0 did not, so the stale local must be refreshed for the
+      // is_dp200 test below to see it
+      scanner_model =
+        g_hash_table_lookup(osr->properties, "ventana.ScannerModel");
     } else if (g_error_matches(tmp_err, OPENSLIDE_ERROR,
                                    OPENSLIDE_ERROR_NO_VALUE)) {
       // Clear error if it's just no value
@@ -858,7 +873,6 @@ static bool ventana_open(openslide_t *osr, const char *filename,
     }
   }
   bool is_dp200 = scanner_model && !strcmp(scanner_model, SCANNER_MODEL_DP_200);
-*/
 
   // walk directories
   g_autoptr(GPtrArray) level_array =
