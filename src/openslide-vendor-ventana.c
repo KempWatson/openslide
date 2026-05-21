@@ -131,9 +131,6 @@ struct joint {
 };
 
 struct tile {
-  // For DP 200 scanners, the per-tile offset accumulated from TileJointInfo
-  // OverlapX/OverlapY values. Unused for pre-DP-200 scanners (which derive
-  // a single tile_advance_x/y from the weighted average of all joints).
   double offset_x;
   double offset_y;
 };
@@ -310,10 +307,11 @@ static xmlNode *get_initial_xml_iscan(xmlDoc *doc, GError **err) {
   } else if (!xmlStrcmp(root->name, BAD_CAST ENCODEINFO_XML_ROOT)) {
     for (xmlNode *node = root->children; node; node = node->next) {
       if (!xmlStrcmp(node->name, BAD_CAST SLIDEINFO_XML_ROOT)) {
-        for (xmlNode *inner = node->children; inner; inner = inner->next) {
-          if (!xmlStrcmp(inner->name, BAD_CAST INITIAL_XML_ISCAN)) {
-            // /EncodeInfo/SlideInfo/iScan, found in DP 200 slides at level 1
-            return inner;
+        for (xmlNode *innerNode = node->children; innerNode; 
+              innerNode = innerNode->next) {
+          if (!xmlStrcmp(innerNode->name, BAD_CAST INITIAL_XML_ISCAN)) {
+            // /EncodeInfo/SlideInfo/iScan, found in some slides at level 1
+            return innerNode;
           }
         }
       }
@@ -397,11 +395,8 @@ static int width_compare(gconstpointer a, gconstpointer b) {
   }
 }
 
-// Parse the iScan XML block (which may come from level 0 or, for some
-// DP 200 slides, from level 1 inside EncodeInfo/SlideInfo). Copies all
-// iScan attributes to vendor properties.
-static bool parse_ventana_iScan_xml(openslide_t *osr, const char *xml,
-                                    GError **err) {
+static bool parse_initial_xml(openslide_t *osr, const char *xml,
+                              GError **err) {
   // parse
   g_autoptr(xmlDoc) doc = _openslide_xml_parse(xml, err);
   if (!doc) {
@@ -424,23 +419,11 @@ static bool parse_ventana_iScan_xml(openslide_t *osr, const char *xml,
     }
   }
 
-  return true;
-}
-
-static bool parse_initial_xml(openslide_t *osr, const char *xml,
-                              GError **err) {
-  // parse and copy iScan attributes
-  if (!parse_ventana_iScan_xml(osr, xml, err)) {
-    return false;
-  }
-
-  // set background color from iScan ScanWhitePoint property, if present
+  // set background color from iScan node property.
   char *wp_str = g_hash_table_lookup(osr->properties,
                                      "ventana.ScanWhitePoint");
-  if (wp_str) {
-    uint8_t wp = g_ascii_strtoull(wp_str, NULL, 10);
-    _openslide_set_background_color_prop(osr, wp, wp, wp);
-  }
+  uint8_t wp = wp_str ? g_ascii_strtoull(wp_str, NULL, 10) : 255;
+  _openslide_set_background_color_prop(osr, wp, wp, wp);
 
   // set standard properties
   _openslide_duplicate_int_prop(osr, "ventana.Magnification",
@@ -600,21 +583,18 @@ static struct bif *parse_level0_xml(const char *xml,
         return NULL;
       }
 
-      // read joint values into a local struct
+      // read joint values
       struct joint joint;
       PARSE_DOUBLE_ATTRIBUTE_OR_RETURN(joint_info, ATTR_OVERLAP_X,
-                                       joint.offset_x, NULL);
+                                     joint.offset_x, NULL);
       joint.offset_x *= -1;
       PARSE_DOUBLE_ATTRIBUTE_OR_RETURN(joint_info, ATTR_OVERLAP_Y,
-                                       joint.offset_y, NULL);
+                                     joint.offset_y, NULL);
       joint.offset_y *= -1;
       PARSE_INT_ATTRIBUTE_OR_RETURN(joint_info, ATTR_CONFIDENCE,
-                                    joint.confidence, NULL);
+                                  joint.confidence, NULL);
 
-      // check coordinates against direction, and store the per-tile offset.
-      // DP 200 scanners emit horizontal joins labeled either RIGHT or LEFT;
-      // both describe the same kind of join (tile2 to the right of tile1,
-      // overlap recorded on tile2) and are treated identically.
+      // check coordinates against direction, and get joint
       g_autoptr(xmlChar) direction =
         xmlGetProp(joint_info, BAD_CAST ATTR_DIRECTION);
       bool ok;
@@ -622,13 +602,13 @@ static struct bif *parse_level0_xml(const char *xml,
       //g_debug("%s, tile1 %"PRId64" %"PRId64", tile2 %"PRId64" %"PRId64, (char *) direction, tile1_col, tile1_row, tile2_col, tile2_row);
       if (!xmlStrcmp(direction, BAD_CAST DIRECTION_RIGHT) ||
           !xmlStrcmp(direction, BAD_CAST DIRECTION_LEFT)) {
-        // horizontal join: record offset on the right tile (tile2)
+        // Get the right tile.
         struct tile *tile =
           &area->tiles[tile2_row * area->tiles_across + tile2_col];
         tile->offset_x = joint.offset_x;
         ok = (tile2_col == tile1_col + 1 && tile2_row == tile1_row);
       } else if (!xmlStrcmp(direction, BAD_CAST DIRECTION_UP)) {
-        // vertical join: record offset on the lower tile (tile1)
+        // Get the top tile.
         struct tile *tile =
           &area->tiles[tile1_row * area->tiles_across + tile1_col];
         tile->offset_y = joint.offset_y;
@@ -639,6 +619,7 @@ static struct bif *parse_level0_xml(const char *xml,
                     "Bad direction attribute \"%s\"", (char *) direction);
         return NULL;
       }
+
       if (!ok) {
         g_set_error(err, OPENSLIDE_ERROR, OPENSLIDE_ERROR_FAILED,
                     "Unexpected tile join: %s, "
@@ -648,9 +629,7 @@ static struct bif *parse_level0_xml(const char *xml,
         return NULL;
       }
 
-      // read values (faithful to patched 4.0.0.8 — re-parses the same three
-      // attributes; functionally a no-op since joint values are unchanged
-      // between the first parse above and this point)
+      // read values
       PARSE_DOUBLE_ATTRIBUTE_OR_RETURN(joint_info, ATTR_OVERLAP_X,
                                        joint.offset_x, NULL);
       joint.offset_x *= -1;
@@ -660,7 +639,7 @@ static struct bif *parse_level0_xml(const char *xml,
       PARSE_INT_ATTRIBUTE_OR_RETURN(joint_info, ATTR_CONFIDENCE,
                                     joint.confidence, NULL);
 
-      // add to weighted totals used to derive bif->tile_advance_x/y
+      // add to totals
       if (direction_y) {
         total_offset_y += joint.confidence * joint.offset_y;
         total_y_weight += joint.confidence;
@@ -680,6 +659,7 @@ static struct bif *parse_level0_xml(const char *xml,
     bif->tile_advance_x = tiff_tile_width;
     bif->tile_advance_y = tiff_tile_height;
   } else {
+    // Pre-DP 200
     bif->tile_advance_x = tiff_tile_width + total_offset_x / total_x_weight;
     bif->tile_advance_y = tiff_tile_height + total_offset_y / total_y_weight;
   }
@@ -775,33 +755,30 @@ static struct _openslide_grid *create_bif_grid(openslide_t *osr,
 
   for (int32_t i = 0; i < bif->num_areas; i++) {
     struct area *area = bif->areas[i];
-    //g_debug("ds %g area %d pos %"PRId64" %"PRId64, downsample, i, area->x, area->y);
+    //g_debug("ds %g area %d pos %"PRId64" %"PRId64" offset %g %g", downsample, i, area->x, area->y, offset_x, offset_y);
 
     // BIF files can have tiles with overlap, which is adjusted for using an
     // offset value. Here we accumulate the total offsets in each direction as
     // we iterate through the tiles to prevent gaps from appearing.
 
-    // Each area has an x and y offset to ensure that it starts at area->x in
-    // the tilemap grid. Without this offset, it will start at the start
-    // row/column times the tile width which is not always correct due to
-    // accumulated overlaps/offsets in previous areas.
-    double area_offset_x =
-      area->x - (area->start_col * bif->tile_advance_x + slide_start_x);
-    double area_offset_y =
-      area->y - (area->start_row * bif->tile_advance_y + slide_start_y);
+    // Each area has an x and y offset to ensure that it starts at area->x in the tilemap
+    // grid. Without this offset, it will start at the start row/column times the tile width
+    // which is not always correct due to accumulated overlaps/offsets in previous areas
+    double area_offset_x = area->x - (area->start_col * bif->tile_advance_x + slide_start_x);
+    double area_offset_y = area->y - (area->start_row * bif->tile_advance_y + slide_start_y);
 
     // cumulative offset_y for each column
-    g_autofree double *offset_ys = g_new(double, area->tiles_across);
+    double offset_ys[area->tiles_across];
     for (int64_t col = 0; col < area->tiles_across; col++) {
       offset_ys[col] = area_offset_y;
     }
 
     for (int64_t row = 0; row < area->tiles_down; row++) {
-      // cumulative offset_x for this row
+      // cumulative offset_x for this row;
       double offset_x = area_offset_x;
       for (int64_t col = 0; col < area->tiles_across; col++) {
         if (is_dp200) {
-          // use the per-tile offsets only for DP 200 scans
+          // use the tile offsets only for DP 200 scans.
           struct tile *tile = &area->tiles[row * area->tiles_across + col];
           offset_x += tile->offset_x;
           offset_ys[col] += tile->offset_y;
@@ -809,8 +786,8 @@ static struct _openslide_grid *create_bif_grid(openslide_t *osr,
         _openslide_grid_tilemap_add_tile(grid,
                                          area->start_col + col,
                                          area->start_row + row,
-                                         offset_x / downsample,
-                                         offset_ys[col] / downsample,
+                                         (offset_x) / downsample,
+                                         (offset_ys[col]) / downsample,
                                          subtile_w, subtile_h,
                                          NULL);
       }
@@ -859,33 +836,29 @@ static bool ventana_open(openslide_t *osr, const char *filename,
     return false;
   }
 
-  // Determine whether this is a DP 200 scanner. ScannerModel comes from the
-  // iScan element at level 0. Some slides also carry an iScan element under
-  // EncodeInfo/SlideInfo at level 1; the patched 4.0.0.8 source parses this
-  // as a fallback. Note that, faithful to the patched source, scanner_model
-  // is NOT re-read after this fallback parse; the local variable remains
-  // whatever it was after the level-0 lookup.
   char *scanner_model =
     g_hash_table_lookup(osr->properties, "ventana.ScannerModel");
-  if (!scanner_model) {
+  // check level 1 for additional metadata if we're missing a scanner model
+  if (scanner_model == NULL) {
     GError *tmp_err = NULL;
-    const char *lvl1_xml = _openslide_tifflike_get_buffer(tl, 1,
+    const char *lvl1_xml = _openslide_tifflike_get_buffer(tl, 1, 
                                                           TIFFTAG_XMLPACKET,
                                                           &tmp_err);
+
+/*
     if (lvl1_xml) {
-      if (!parse_ventana_iScan_xml(osr, lvl1_xml, err)) {
-        return false;
-      }
+      parse_ventana_iScan_xml(osr, lvl1_xml, err);
     } else if (g_error_matches(tmp_err, OPENSLIDE_ERROR,
-                               OPENSLIDE_ERROR_NO_VALUE)) {
+                                   OPENSLIDE_ERROR_NO_VALUE)) {
+      // Clear error if it's just no value
       g_clear_error(&tmp_err);
     } else {
       g_propagate_error(err, tmp_err);
       return false;
     }
   }
-  bool is_dp200 = scanner_model &&
-                  !strcmp(scanner_model, SCANNER_MODEL_DP_200);
+  bool is_dp200 = scanner_model && !strcmp(scanner_model, SCANNER_MODEL_DP_200);
+*/
 
   // walk directories
   g_autoptr(GPtrArray) level_array =
@@ -946,8 +919,7 @@ static bool ventana_open(openslide_t *osr, const char *filename,
             return false;
           }
           // parse
-          bif = parse_level0_xml(xml, tiffl.tile_w, tiffl.tile_h,
-                                 is_dp200, err);
+          bif = parse_level0_xml(xml, tiffl.tile_w, tiffl.tile_h, is_dp200, err);
           if (!bif) {
             return false;
           }
@@ -1001,12 +973,12 @@ static bool ventana_open(openslide_t *osr, const char *filename,
                                   is_dp200);
         l->subtiles_per_tile = downsample;
         // the format doesn't seem to record the level size, so make it
-        // large enough for all the pixels. For DP 200, round up to a
-        // 16-pixel boundary (matches how the scanner emits image data).
+        // large enough for all the pixels
         double x, y, w, h;
         _openslide_grid_get_bounds(l->grid, &x, &y, &w, &h);
-        l->base.w = is_dp200 ? ceil(ceil(x + w) / 16.0) * 16 : ceil(x + w);
-        l->base.h = is_dp200 ? ceil(ceil(y + h) / 16.0) * 16 : ceil(y + h);
+        // adjust height and width so it is 16 px aligned on dp200 slides   
+        l->base.w = is_dp200 ? ceil(ceil(x + w) / 16) * 16 : ceil(x + w);
+        l->base.h = is_dp200 ? ceil(ceil(y + h) / 16) * 16 : ceil(y + h);
         // clear tile size hints set by _openslide_tiff_level_init()
         l->base.tile_w = 0;
         l->base.tile_h = 0;
